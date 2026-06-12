@@ -1,0 +1,216 @@
+name: Build and publish wheels
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*.*.*"
+      - "*.*.*"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "pyproject.toml"
+      - "src/**"
+      - ".github/workflows/rust-pypi-wheels.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test Rust CLI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  build-wheels:
+    name: Build wheel (${{ matrix.platform.name }})
+    needs: test
+    runs-on: ${{ matrix.platform.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64
+            manylinux: auto
+            cflags_aarch64: ""
+          - name: linux-i686
+            os: ubuntu-latest
+            target: i686
+            manylinux: auto
+            cflags_aarch64: ""
+          - name: linux-aarch64
+            os: ubuntu-latest
+            target: aarch64
+            manylinux: auto
+            cflags_aarch64: "-D__ARM_ARCH=8"
+          - name: linux-armv7
+            os: ubuntu-latest
+            target: armv7
+            manylinux: auto
+            cflags_aarch64: ""
+          - name: macos-x86_64
+            os: macos-13
+            target: x86_64
+            manylinux: auto
+            cflags_aarch64: ""
+          - name: macos-aarch64
+            os: macos-14
+            target: aarch64
+            manylinux: auto
+            cflags_aarch64: ""
+          - name: windows-x86_64
+            os: windows-latest
+            target: x64
+            manylinux: auto
+            cflags_aarch64: ""
+          - name: windows-i686
+            os: windows-latest
+            target: x86
+            manylinux: auto
+            cflags_aarch64: ""
+          - name: windows-aarch64
+            os: windows-latest
+            target: aarch64
+            manylinux: auto
+            cflags_aarch64: ""
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        env:
+          AUTHSWAP_WEBDAV_URL: ""
+          AUTHSWAP_WEBDAV_USERNAME: ""
+          AUTHSWAP_WEBDAV_PASSWORD: ""
+          AUTHSWAP_WEBDAV_TOKEN: ""
+          AUTHSWAP_CODEX_USAGE_URL: ""
+          CODEX_HOME: ""
+          HTTP_PROXY: ""
+          HTTPS_PROXY: ""
+          ALL_PROXY: ""
+          CFLAGS_aarch64_unknown_linux_gnu: ${{ matrix.platform.cflags_aarch64 }}
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist --find-interpreter
+          sccache: true
+          manylinux: ${{ matrix.platform.manylinux }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform.name }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  build-sdist:
+    name: Build sdist
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        env:
+          AUTHSWAP_WEBDAV_URL: ""
+          AUTHSWAP_WEBDAV_USERNAME: ""
+          AUTHSWAP_WEBDAV_PASSWORD: ""
+          AUTHSWAP_WEBDAV_TOKEN: ""
+          AUTHSWAP_CODEX_USAGE_URL: ""
+          CODEX_HOME: ""
+          HTTP_PROXY: ""
+          HTTPS_PROXY: ""
+          ALL_PROXY: ""
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  verify-artifacts:
+    name: Verify release artifacts
+    needs:
+      - build-wheels
+      - build-sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+      - name: Reject packaged local config files
+        shell: bash
+        run: |
+          python3 <<'PY'
+          import re
+          import tarfile
+          import zipfile
+          from pathlib import Path
+
+          forbidden = re.compile(
+              r"(^|/)(\.codex|\.env|auth\.json|authswap\.json|config\.toml|registry\.json)$"
+              r"|(^|/)[^/]+\.auth\.json$"
+              r"|(^|/)(accounts|proxy|webdav)(/|$)",
+              re.IGNORECASE,
+          )
+          artifacts = sorted(Path("dist").glob("*"))
+          if not artifacts:
+              raise SystemExit("no artifacts found")
+          offenders = []
+          for artifact in artifacts:
+              names = []
+              if artifact.suffix == ".whl":
+                  with zipfile.ZipFile(artifact) as archive:
+                      names = archive.namelist()
+              elif artifact.name.endswith(".tar.gz"):
+                  with tarfile.open(artifact, "r:gz") as archive:
+                      names = archive.getnames()
+              for name in names:
+                  normalized = name.replace("\\", "/")
+                  if forbidden.search(normalized):
+                      offenders.append(f"{artifact}: {name}")
+          if offenders:
+              raise SystemExit(
+                  "release artifacts contain local config-like files:\n"
+                  + "\n".join(offenders)
+              )
+          PY
+
+  publish:
+    name: Publish to PyPI
+    if: github.ref_type == 'tag'
+    needs:
+      - verify-artifacts
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/authswap/
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "authswap"
+version = "1.0.0"
+description = "Rust authswap CLI with WebDAV sync and Codex app-server restart"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "wangxingyou" }]
+keywords = ["codex", "authswap", "webdav"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Rust",
+  "Topic :: Utilities"
+]
+
+[project.urls]
+Homepage = "https://github.com/shevekwang/authswap"
+Repository = "https://github.com/shevekwang/authswap"
+Issues = "https://github.com/shevekwang/authswap/issues"
+
+[tool.maturin]
+bindings = "bin"
+strip = true

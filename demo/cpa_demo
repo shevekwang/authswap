@@ -1,0 +1,10 @@
+{
+  "currentAccount": {
+    "accountId": "acct-cpa-demo",
+    "tokens": {
+      "access_token": "demo.cpa.access",
+      "refresh_token": "demo-cpa-refresh",
+      "id_token": "demo-cpa-id"
+    }
+  }
+}

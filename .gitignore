@@ -1,0 +1,12 @@
+/target
+/dist
+/*.egg-info
+.env
+AGENTS.md
+.codex/
+auth.json
+authswap.json
+config.toml
+accounts/
+*.auth.json
+registry.json

@@ -1,0 +1,15 @@
+{
+  "data": {
+    "subscriptions": [
+      {
+        "user": "sub2api-demo",
+        "auth": {
+          "access_token": "demo.sub2api.access",
+          "refresh_token": "demo-sub2api-refresh",
+          "id_token": "demo-sub2api-id",
+          "account_id": "acct-sub2api-demo"
+        }
+      }
+    ]
+  }
+}
