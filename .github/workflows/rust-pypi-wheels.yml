@@ -2,8 +2,6 @@ name: Build and publish wheels
 
 on:
   push:
-    branches:
-      - main
     tags:
       - "v*.*.*"
       - "*.*.*"
@@ -58,11 +56,6 @@ jobs:
           - name: linux-armv7
             os: ubuntu-latest
             target: armv7
-            manylinux: auto
-            cflags_aarch64: ""
-          - name: macos-x86_64
-            os: macos-13
-            target: x86_64
             manylinux: auto
             cflags_aarch64: ""
           - name: macos-aarch64
