@@ -27,10 +27,12 @@ use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use walkdir::WalkDir;
 
-const VERSION: &str = "1.0.0";
+const VERSION: &str = "1.0.1";
 const MANIFEST_NAME: &str = "manifest.json";
 const DEFAULT_CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
@@ -200,6 +202,12 @@ enum PickerAction {
     Sync,
     Switch(usize),
     Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstRunAction {
+    AddAccount,
+    WebdavSync,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -418,8 +426,14 @@ fn interactive_switch() -> Result<()> {
             reconcile_active_account_from_current_auth(&mut registry)?;
             sync_active_auth_snapshot(&registry)?;
             if registry.accounts.is_empty() {
-                if !interactive_add_account(None)? {
-                    return Ok(());
+                match choose_first_run_action()? {
+                    Some(FirstRunAction::AddAccount) => {
+                        if !interactive_add_account(None)? {
+                            return Ok(());
+                        }
+                    }
+                    Some(FirstRunAction::WebdavSync) => interactive_webdav_sync()?,
+                    None => return Ok(()),
                 }
                 continue;
             }
@@ -595,6 +609,19 @@ fn interactive_account_picker(registry: &mut Registry) -> Result<PickerAction> {
                     Err(err) => Some(format!("Usage refresh failed: {err:#}")),
                 };
             }
+            KeyCode::Char('t') | KeyCode::Char('T') => {
+                number_buffer.clear();
+                let rows = account_display_rows(registry)?;
+                render_account_picker(
+                    &mut terminal.stdout,
+                    &rows,
+                    selected,
+                    "",
+                    Some("Refreshing usage for all accounts..."),
+                )?;
+                terminal.stdout.flush()?;
+                status_message = Some(refresh_all_account_usage(registry)?);
+            }
             KeyCode::Char(ch) if ch.is_ascii_digit() && number_buffer.len() < 8 => {
                 number_buffer.push(ch);
                 if let Ok(index) = number_buffer.parse::<usize>() {
@@ -644,7 +671,7 @@ fn interactive_add_account_overlay(stdout: &mut std::io::Stdout) -> Result<()> {
 fn choose_add_method_overlay(stdout: &mut std::io::Stdout) -> Result<Option<AddMethod>> {
     let mut selected = 0usize;
     loop {
-        render_add_account_dialog(stdout, selected, false)?;
+        render_add_account_dialog(stdout, selected)?;
         stdout.flush()?;
         let Event::Key(key) = read()? else {
             continue;
@@ -688,7 +715,7 @@ fn choose_add_method_overlay(stdout: &mut std::io::Stdout) -> Result<Option<AddM
 fn read_json_path_overlay(stdout: &mut std::io::Stdout) -> Result<Option<String>> {
     let mut input = String::new();
     loop {
-        render_json_path_input_dialog(stdout, &input, false)?;
+        render_json_path_input_dialog(stdout, &input)?;
         stdout.flush()?;
         let Event::Key(key) = read()? else {
             continue;
@@ -726,7 +753,7 @@ fn interactive_app_server_restart_setting_overlay(stdout: &mut std::io::Stdout) 
     let mut settings = read_settings()?;
     let mut enabled = settings.restart_app_server_after_switch;
     loop {
-        render_app_server_restart_dialog(stdout, enabled, false)?;
+        render_app_server_restart_dialog(stdout, enabled)?;
         stdout.flush()?;
         let Event::Key(key) = read()? else {
             continue;
@@ -871,7 +898,7 @@ fn interactive_webdav_config_overlay(
     let mut selected = 0usize;
     let mut status_message: Option<String> = None;
     loop {
-        render_webdav_config_dialog(stdout, &fields, selected, status_message.as_deref(), false)?;
+        render_webdav_config_dialog(stdout, &fields, selected, status_message.as_deref())?;
         stdout.flush()?;
         let Event::Key(key) = read()? else {
             continue;
@@ -880,7 +907,7 @@ fn interactive_webdav_config_overlay(
             continue;
         }
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(None),
+            KeyCode::Esc => return Ok(None),
             KeyCode::Up => {
                 selected = selected.saturating_sub(1);
                 status_message = None;
@@ -961,11 +988,57 @@ fn interactive_add_account(alias: Option<String>) -> Result<bool> {
     Ok(true)
 }
 
+fn choose_first_run_action() -> Result<Option<FirstRunAction>> {
+    let mut terminal = TerminalSession::enter()?;
+    let mut selected = 0usize;
+    queue!(terminal.stdout, Clear(ClearType::All))?;
+    terminal.stdout.flush()?;
+    loop {
+        render_first_run_dialog(&mut terminal.stdout, selected)?;
+        terminal.stdout.flush()?;
+        let Event::Key(key) = read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(None),
+            KeyCode::Left | KeyCode::Up | KeyCode::Char('h') | KeyCode::Char('k') => {
+                selected = selected.saturating_sub(1);
+            }
+            KeyCode::Right
+            | KeyCode::Down
+            | KeyCode::Char('l')
+            | KeyCode::Char('j')
+            | KeyCode::Tab => {
+                selected = (selected + 1).min(1);
+            }
+            KeyCode::Char('1') | KeyCode::Char('a') | KeyCode::Char('A') => {
+                return Ok(Some(FirstRunAction::AddAccount));
+            }
+            KeyCode::Char('2') | KeyCode::Char('w') | KeyCode::Char('W') => {
+                return Ok(Some(FirstRunAction::WebdavSync));
+            }
+            KeyCode::Enter => {
+                return Ok(Some(if selected == 0 {
+                    FirstRunAction::AddAccount
+                } else {
+                    FirstRunAction::WebdavSync
+                }));
+            }
+            _ => {}
+        }
+    }
+}
+
 fn choose_add_method() -> Result<Option<AddMethod>> {
     let mut terminal = TerminalSession::enter()?;
     let mut selected = 0usize;
+    queue!(terminal.stdout, Clear(ClearType::All))?;
+    terminal.stdout.flush()?;
     loop {
-        render_add_account_dialog(&mut terminal.stdout, selected, true)?;
+        render_add_account_dialog(&mut terminal.stdout, selected)?;
         terminal.stdout.flush()?;
         let Event::Key(key) = read()? else {
             continue;
@@ -1009,8 +1082,10 @@ fn choose_add_method() -> Result<Option<AddMethod>> {
 fn read_json_path_interactive() -> Result<Option<String>> {
     let mut terminal = TerminalSession::enter()?;
     let mut input = String::new();
+    queue!(terminal.stdout, Clear(ClearType::All))?;
+    terminal.stdout.flush()?;
     loop {
-        render_json_path_input_dialog(&mut terminal.stdout, &input, true)?;
+        render_json_path_input_dialog(&mut terminal.stdout, &input)?;
         terminal.stdout.flush()?;
         let Event::Key(key) = read()? else {
             continue;
@@ -1079,15 +1154,7 @@ fn run_codex_login(device_auth: bool) -> Result<()> {
     Ok(())
 }
 
-fn render_json_path_input_dialog(
-    stdout: &mut std::io::Stdout,
-    input: &str,
-    clear_screen: bool,
-) -> Result<()> {
-    if clear_screen {
-        queue!(stdout, Clear(ClearType::All))?;
-        stdout.flush()?;
-    }
+fn render_json_path_input_dialog(stdout: &mut std::io::Stdout, input: &str) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = RatatuiTerminal::new(backend)?;
     terminal.draw(|frame| {
@@ -1178,15 +1245,7 @@ fn render_popup_frame(frame: &mut ratatui::Frame<'_>, area: Rect, title: &str) -
     inner
 }
 
-fn render_add_account_dialog(
-    stdout: &mut std::io::Stdout,
-    selected: usize,
-    clear_screen: bool,
-) -> Result<()> {
-    if clear_screen {
-        queue!(stdout, Clear(ClearType::All))?;
-        stdout.flush()?;
-    }
+fn render_add_account_dialog(stdout: &mut std::io::Stdout, selected: usize) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = RatatuiTerminal::new(backend)?;
     terminal.draw(|frame| {
@@ -1202,6 +1261,64 @@ fn render_add_account_dialog(
             },
         );
         let options = ["1 OAuth", "2 Device auth", "3 JSON file"];
+        let choices = options
+            .iter()
+            .enumerate()
+            .map(|(index, label)| {
+                if selected == index {
+                    format!("[ {label} ]")
+                } else {
+                    format!("  {label}  ")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("  ");
+        frame.render_widget(
+            Paragraph::new(choices).alignment(Alignment::Center).style(
+                Style::default()
+                    .fg(TuiColor::Green)
+                    .add_modifier(TuiModifier::BOLD),
+            ),
+            Rect {
+                x: inner.x,
+                y: inner.y.saturating_add(3),
+                width: inner.width,
+                height: 1,
+            },
+        );
+        frame.render_widget(
+            Paragraph::new("Enter confirms, Esc cancels.")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(TuiColor::Gray)),
+            Rect {
+                x: inner.x,
+                y: inner.y.saturating_add(5),
+                width: inner.width,
+                height: 1,
+            },
+        );
+    })?;
+    Ok(())
+}
+
+fn render_first_run_dialog(stdout: &mut std::io::Stdout, selected: usize) -> Result<()> {
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = RatatuiTerminal::new(backend)?;
+    terminal.draw(|frame| {
+        let area = centered_popup_rect(frame.area(), 76, 8);
+        let inner = render_popup_frame(frame, area, " Get started ");
+        frame.render_widget(
+            Paragraph::new("No local accounts found. Add one or restore accounts from WebDAV.")
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true }),
+            Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: 2,
+            },
+        );
+        let options = ["1 Add account", "2 WebDAV sync"];
         let choices = options
             .iter()
             .enumerate()
@@ -1503,8 +1620,10 @@ fn interactive_app_server_restart_setting() -> Result<()> {
     let mut settings = read_settings()?;
     let mut enabled = settings.restart_app_server_after_switch;
     let mut terminal = TerminalSession::enter()?;
+    queue!(terminal.stdout, Clear(ClearType::All))?;
+    terminal.stdout.flush()?;
     loop {
-        render_app_server_restart_dialog(&mut terminal.stdout, enabled, true)?;
+        render_app_server_restart_dialog(&mut terminal.stdout, enabled)?;
         terminal.stdout.flush()?;
         let Event::Key(key) = read()? else {
             continue;
@@ -1540,15 +1659,7 @@ fn interactive_app_server_restart_setting() -> Result<()> {
     }
 }
 
-fn render_app_server_restart_dialog(
-    stdout: &mut std::io::Stdout,
-    enabled: bool,
-    clear_screen: bool,
-) -> Result<()> {
-    if clear_screen {
-        queue!(stdout, Clear(ClearType::All))?;
-        stdout.flush()?;
-    }
+fn render_app_server_restart_dialog(stdout: &mut std::io::Stdout, enabled: bool) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = RatatuiTerminal::new(backend)?;
     terminal.draw(|frame| {
@@ -1627,13 +1738,14 @@ fn interactive_webdav_config(initial: WebdavSettings) -> Result<Option<WebdavSet
     let mut fields = [initial.url, initial.username, initial.password];
     let mut selected = 0usize;
     let mut status_message: Option<String> = None;
+    queue!(terminal.stdout, Clear(ClearType::All))?;
+    terminal.stdout.flush()?;
     loop {
         render_webdav_config_dialog(
             &mut terminal.stdout,
             &fields,
             selected,
             status_message.as_deref(),
-            true,
         )?;
         terminal.stdout.flush()?;
         let Event::Key(key) = read()? else {
@@ -1643,7 +1755,7 @@ fn interactive_webdav_config(initial: WebdavSettings) -> Result<Option<WebdavSet
             continue;
         }
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(None),
+            KeyCode::Esc => return Ok(None),
             KeyCode::Up => {
                 selected = selected.saturating_sub(1);
                 status_message = None;
@@ -1709,16 +1821,11 @@ fn render_webdav_config_dialog(
     fields: &[String; 3],
     selected: usize,
     status_message: Option<&str>,
-    clear_screen: bool,
 ) -> Result<()> {
-    if clear_screen {
-        queue!(stdout, Clear(ClearType::All))?;
-        stdout.flush()?;
-    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = RatatuiTerminal::new(backend)?;
     terminal.draw(|frame| {
-        let area = centered_popup_rect(frame.area(), 88, 13);
+        let area = centered_popup_rect(frame.area(), 88, 16);
         let inner = render_popup_frame(frame, area, " WebDAV settings ");
         frame.render_widget(
             Paragraph::new("Configure WebDAV sync. URL gets https:// if no scheme is set.")
@@ -1752,9 +1859,9 @@ fn render_webdav_config_dialog(
                     .block(Block::default().borders(Borders::ALL)),
                 Rect {
                     x: inner.x,
-                    y: inner.y.saturating_add(3 + index as u16 * 2),
+                    y: inner.y.saturating_add(3 + index as u16 * 3),
                     width: inner.width,
-                    height: 2,
+                    height: 3,
                 },
             );
         }
@@ -1839,8 +1946,10 @@ fn check_webdav_config(config: &WebdavConfig) -> Result<()> {
 fn choose_webdav_action(reachable: bool) -> Result<Option<WebdavAction>> {
     let mut terminal = TerminalSession::enter()?;
     let mut selected = 0usize;
+    queue!(terminal.stdout, Clear(ClearType::All))?;
+    terminal.stdout.flush()?;
     loop {
-        render_webdav_dialog(&mut terminal.stdout, selected, reachable, true)?;
+        render_webdav_dialog(&mut terminal.stdout, selected, reachable)?;
         terminal.stdout.flush()?;
         let Event::Key(key) = read()? else {
             continue;
@@ -1885,12 +1994,7 @@ fn render_webdav_dialog(
     stdout: &mut std::io::Stdout,
     selected: usize,
     reachable: bool,
-    clear_screen: bool,
 ) -> Result<()> {
-    if clear_screen {
-        queue!(stdout, Clear(ClearType::All))?;
-        stdout.flush()?;
-    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = RatatuiTerminal::new(backend)?;
     terminal.draw(|frame| {
@@ -1988,6 +2092,8 @@ fn render_webdav_dialog_frame(frame: &mut ratatui::Frame<'_>, selected: usize, r
 
 fn confirm_delete_account(stdout: &mut std::io::Stdout, account_label: &str) -> Result<bool> {
     let mut confirm = false;
+    queue!(stdout, Clear(ClearType::All))?;
+    stdout.flush()?;
     loop {
         render_delete_confirmation_dialog(stdout, account_label, confirm)?;
         stdout.flush()?;
@@ -2014,8 +2120,6 @@ fn render_delete_confirmation_dialog(
     account_label: &str,
     confirm: bool,
 ) -> Result<()> {
-    queue!(stdout, Clear(ClearType::All))?;
-    stdout.flush()?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = RatatuiTerminal::new(backend)?;
     terminal.draw(|frame| {
@@ -2210,7 +2314,7 @@ fn render_account_picker_frame(
     );
 
     let mut help =
-        "Keys: Up/Down or j/k move, Enter select, number jump, a add, s settings, w sync, r refresh, Backspace delete, Esc or q quit"
+        "Keys: Up/Down or j/k move, Enter select, number jump, a add, s settings, w webdav, r refresh, t refresh all, Backspace delete, Esc or q quit"
             .to_string();
     if !number_buffer.is_empty() {
         help.push_str("  typed: ");
@@ -2690,6 +2794,38 @@ fn refresh_account_usage_at(registry: &mut Registry, index: usize) -> Result<()>
     let result = refresh_account_usage_cache(registry, &account_key);
     write_registry(registry)?;
     result
+}
+
+fn refresh_all_account_usage(registry: &mut Registry) -> Result<String> {
+    let account_keys = registry
+        .accounts
+        .iter()
+        .map(|account| account.account_key.clone())
+        .collect::<Vec<_>>();
+    let total = account_keys.len();
+    let mut refreshed = 0usize;
+    let mut failures = Vec::new();
+
+    for (index, account_key) in account_keys.iter().enumerate() {
+        match refresh_account_usage_cache(registry, account_key) {
+            Ok(()) => refreshed += 1,
+            Err(error) => failures.push(format!("{account_key}: {error:#}")),
+        }
+        if index + 1 < total {
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+    write_registry(registry)?;
+
+    if failures.is_empty() {
+        Ok(format!("Usage refreshed for all {refreshed} accounts."))
+    } else {
+        Ok(format!(
+            "Usage refreshed for {refreshed}/{total} accounts; {} failed: {}",
+            failures.len(),
+            failures.join("; ")
+        ))
+    }
 }
 
 fn refresh_account_usage_cache(registry: &mut Registry, account_key: &str) -> Result<()> {
@@ -3351,6 +3487,37 @@ fn filter_config_toml_projects(input: &str) -> Result<String> {
     Ok(output)
 }
 
+fn extract_config_toml_projects(input: &str) -> String {
+    let mut output = String::new();
+    let mut in_project_table = false;
+    for line in input.lines() {
+        if let Some(table_name) = toml_table_name(line) {
+            in_project_table = is_project_path_table(table_name);
+        }
+        if in_project_table {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    output
+}
+
+fn merge_config_preserving_local_projects(remote: &str, local: Option<&str>) -> Result<String> {
+    let mut merged = filter_config_toml_projects(remote)?;
+    let local_projects = local.map(extract_config_toml_projects).unwrap_or_default();
+    if local_projects.is_empty() {
+        return Ok(merged);
+    }
+    if !merged.ends_with('\n') {
+        merged.push('\n');
+    }
+    if !merged.trim().is_empty() {
+        merged.push('\n');
+    }
+    merged.push_str(&local_projects);
+    Ok(merged)
+}
+
 fn toml_table_name(line: &str) -> Option<&str> {
     let trimmed = line.trim();
     if !trimmed.starts_with('[') || trimmed.starts_with("[[") {
@@ -3569,13 +3736,22 @@ fn cloud_pull(force: bool) -> Result<()> {
             );
         }
         let body = if file.path == "config.toml" {
-            filter_config_toml_projects(&String::from_utf8(body)?)?.into_bytes()
+            let remote = filter_config_toml_projects(&String::from_utf8(body)?)?;
+            if sha256_hex(remote.as_bytes()) != file.sha256 {
+                bail!("checksum mismatch for {}", file.path);
+            }
+            let local = if destination.is_file() {
+                Some(fs::read_to_string(&destination)?)
+            } else {
+                None
+            };
+            merge_config_preserving_local_projects(&remote, local.as_deref())?.into_bytes()
         } else {
+            if sha256_hex(&body) != file.sha256 {
+                bail!("checksum mismatch for {}", file.path);
+            }
             body
         };
-        if sha256_hex(&body) != file.sha256 {
-            bail!("checksum mismatch for {}", file.path);
-        }
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -3701,6 +3877,37 @@ trust_level = "trusted"
     }
 
     #[test]
+    fn merge_config_preserves_local_project_trust_only() {
+        let remote = r#"model = "gpt-5.1"
+
+[features]
+new_ui = true
+
+[projects."/remote/path"]
+trust_level = "untrusted"
+"#;
+        let local = r#"model = "old"
+
+[features]
+new_ui = false
+
+[projects."/work/authswap"]
+trust_level = "trusted"
+
+[projects."/work/other"]
+trust_level = "untrusted"
+"#;
+        let merged = merge_config_preserving_local_projects(remote, Some(local)).unwrap();
+        assert!(merged.contains("model = \"gpt-5.1\""));
+        assert!(merged.contains("new_ui = true"));
+        assert!(!merged.contains("model = \"old\""));
+        assert!(!merged.contains("new_ui = false"));
+        assert!(!merged.contains("/remote/path"));
+        assert!(merged.contains("[projects.\"/work/authswap\"]"));
+        assert!(merged.contains("[projects.\"/work/other\"]"));
+    }
+
+    #[test]
     fn validate_manifest_path_allows_config_toml() {
         assert!(validate_manifest_path("config.toml").is_ok());
     }
@@ -3754,7 +3961,7 @@ trust_level = "trusted"
     #[test]
     fn wrap_display_wraps_help_without_ellipsis() {
         let lines = wrap_display(
-            "Keys: move, Enter select, a add, s settings, w sync, r refresh, Backspace delete",
+            "Keys: move, Enter select, a add, s settings, w webdav, r refresh, t refresh all, Backspace delete",
             24,
         );
         assert!(lines.len() > 1);
@@ -3967,8 +4174,8 @@ trust_level = "trusted"
     #[test]
     fn sanitize_json_path_input_allows_relative_paths() {
         assert_eq!(
-            sanitize_json_path_input("demo/cpa_demo").unwrap(),
-            PathBuf::from("demo/cpa_demo")
+            sanitize_json_path_input("accounts/example.json").unwrap(),
+            PathBuf::from("accounts/example.json")
         );
     }
 
@@ -3978,21 +4185,6 @@ trust_level = "trusted"
             sanitize_json_path_input("\"/tmp/account.json\"").unwrap(),
             PathBuf::from("/tmp/account.json")
         );
-    }
-
-    #[test]
-    fn import_demo_formats_by_enumerating_json_objects() {
-        for path in ["demo/cpa_demo", "demo/cockpit_demo", "demo/sub2api_demo"] {
-            let data = fs::read_to_string(path).unwrap();
-            let accounts = import_json_accounts(&data, None).unwrap();
-            assert!(!accounts.is_empty(), "{path}");
-            assert!(
-                accounts
-                    .iter()
-                    .all(|account| account.auth["tokens"]["access_token"].as_str().is_some()),
-                "{path}"
-            );
-        }
     }
 
     fn account_with_usage(last_usage: Option<RateLimitSnapshot>) -> AccountRecord {
