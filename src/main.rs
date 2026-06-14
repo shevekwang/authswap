@@ -32,7 +32,7 @@ use std::time::Duration;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use walkdir::WalkDir;
 
-const VERSION: &str = "1.0.1";
+const VERSION: &str = "1.0.2";
 const MANIFEST_NAME: &str = "manifest.json";
 const DEFAULT_CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
@@ -528,6 +528,10 @@ fn interactive_account_picker(registry: &mut Registry) -> Result<PickerAction> {
             }
             KeyCode::Char('w') | KeyCode::Char('W') => {
                 interactive_webdav_sync_overlay(&mut terminal.stdout, registry, selected)?;
+                *registry = read_registry_or_default()?;
+                reconcile_active_account_from_current_auth(registry)?;
+                selected = active_account_index(registry)
+                    .unwrap_or_else(|| selected.min(registry.accounts.len().saturating_sub(1)));
                 number_buffer.clear();
                 status_message = None;
                 render_picker_background(&mut terminal.stdout, registry, selected, None)?;
