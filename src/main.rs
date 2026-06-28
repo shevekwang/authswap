@@ -32,7 +32,7 @@ use std::time::Duration;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use walkdir::WalkDir;
 
-const VERSION: &str = "1.0.2";
+const VERSION: &str = "1.0.3";
 const MANIFEST_NAME: &str = "manifest.json";
 const DEFAULT_CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
@@ -314,6 +314,12 @@ fn codex_home() -> PathBuf {
             let home = env::var_os("HOME").unwrap_or_else(|| ".".into());
             PathBuf::from(home).join(".codex")
         })
+}
+
+fn home_dir() -> PathBuf {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| ".".into())
 }
 
 fn accounts_dir() -> PathBuf {
@@ -3446,6 +3452,7 @@ fn local_sync_files() -> Result<Vec<SyncFile>> {
             }
         }
     }
+    add_local_plugins_if_exists(&mut files)?;
     files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     Ok(files)
 }
@@ -3461,6 +3468,60 @@ fn add_if_exists(files: &mut Vec<SyncFile>, home: &Path, relative: &str) {
             });
         }
     }
+}
+
+fn add_absolute_if_exists(files: &mut Vec<SyncFile>, absolute_path: PathBuf, relative: &str) {
+    if absolute_path.is_file() {
+        if let Ok(data) = fs::read(&absolute_path) {
+            files.push(SyncFile {
+                relative_path: relative.to_string(),
+                absolute_path,
+                data,
+            });
+        }
+    }
+}
+
+fn add_local_plugins_if_exists(files: &mut Vec<SyncFile>) -> Result<()> {
+    let home = home_dir();
+    add_plugin_dir_if_exists(files, &home, "plugins")?;
+    add_absolute_if_exists(
+        files,
+        home.join(".agents/plugins/marketplace.json"),
+        ".agents/plugins/marketplace.json",
+    );
+    Ok(())
+}
+
+fn add_plugin_dir_if_exists(files: &mut Vec<SyncFile>, home: &Path, dir_name: &str) -> Result<()> {
+    let plugin_dir = home.join(dir_name);
+    if !plugin_dir.is_dir() {
+        return Ok(());
+    }
+    for entry in WalkDir::new(&plugin_dir)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+    {
+        if entry.file_type().is_file() {
+            let relative = entry
+                .path()
+                .strip_prefix(home)
+                .with_context(|| {
+                    format!(
+                        "failed to build sync path for plugin file {}",
+                        entry.path().display()
+                    )
+                })?
+                .to_string_lossy()
+                .replace('\\', "/");
+            files.push(SyncFile {
+                relative_path: relative,
+                absolute_path: entry.path().to_path_buf(),
+                data: fs::read(entry.path())?,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn add_config_if_exists(files: &mut Vec<SyncFile>, home: &Path) -> Result<()> {
@@ -3680,7 +3741,7 @@ fn cloud_push(force: bool) -> Result<()> {
             Method::PUT,
             &file.relative_path,
             Some(body.clone()),
-            Some("application/json"),
+            Some(content_type_for_path(&file.relative_path)),
         )?;
         if !(200..300).contains(&status) {
             bail!(
@@ -3719,7 +3780,7 @@ fn cloud_pull(force: bool) -> Result<()> {
         .ok_or_else(|| anyhow!("remote manifest.json does not exist"))?;
     for file in manifest.files {
         let safe_path = validate_manifest_path(&file.path)?;
-        let destination = codex_home().join(safe_path);
+        let destination = sync_destination_for_manifest_path(safe_path);
         if destination.exists() && !force {
             let current_hash = local_hash_for_manifest_path(&destination, &file.path)?;
             if current_hash != file.sha256 {
@@ -3761,11 +3822,45 @@ fn cloud_pull(force: bool) -> Result<()> {
         }
         let tmp = destination.with_extension(format!("tmp-{}", std::process::id()));
         fs::write(&tmp, body)?;
-        set_private_file_permissions(&tmp)?;
+        if is_private_sync_path(&file.path) {
+            set_private_file_permissions(&tmp)?;
+        }
         fs::rename(&tmp, destination)?;
         println!("pulled {}", file.path);
     }
     Ok(())
+}
+
+fn content_type_for_path(path: &str) -> &'static str {
+    if path.ends_with(".json") {
+        "application/json"
+    } else if path.ends_with(".toml") {
+        "application/toml"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+fn sync_destination_for_manifest_path(path: &str) -> PathBuf {
+    sync_destination_for_manifest_path_with_roots(path, &home_dir(), &codex_home())
+}
+
+fn sync_destination_for_manifest_path_with_roots(path: &str, home: &Path, codex: &Path) -> PathBuf {
+    if is_home_sync_path(path) {
+        home.join(path)
+    } else {
+        codex.join(path)
+    }
+}
+
+fn is_home_sync_path(path: &str) -> bool {
+    path.starts_with("plugins/") || path == ".agents/plugins/marketplace.json"
+}
+
+fn is_private_sync_path(path: &str) -> bool {
+    matches!(path, "auth.json" | "config.toml" | "accounts/registry.json")
+        || path.starts_with("accounts/") && path.ends_with(".auth.json")
+        || path == ".agents/plugins/marketplace.json"
 }
 
 fn validate_manifest_path(path: &str) -> Result<&str> {
@@ -3779,8 +3874,13 @@ fn validate_manifest_path(path: &str) -> Result<&str> {
             _ => bail!("remote manifest contains unsafe path: {path}"),
         }
     }
+    if path.ends_with('/') {
+        bail!("remote manifest contains directory path: {path}");
+    }
     if !(matches!(path, "auth.json" | "config.toml" | "accounts/registry.json")
-        || path.starts_with("accounts/") && path.ends_with(".auth.json"))
+        || path.starts_with("accounts/") && path.ends_with(".auth.json")
+        || path.starts_with("plugins/")
+        || path == ".agents/plugins/marketplace.json")
     {
         bail!("remote manifest contains unsupported path: {path}");
     }
@@ -3914,6 +4014,88 @@ trust_level = "untrusted"
     #[test]
     fn validate_manifest_path_allows_config_toml() {
         assert!(validate_manifest_path("config.toml").is_ok());
+    }
+
+    #[test]
+    fn validate_manifest_path_allows_local_plugin_files() {
+        assert!(validate_manifest_path("plugins/pdf-reader/plugin.json").is_ok());
+        assert!(validate_manifest_path(".agents/plugins/marketplace.json").is_ok());
+    }
+
+    #[test]
+    fn validate_manifest_path_rejects_plugin_directory_paths() {
+        assert!(validate_manifest_path("plugins/").is_err());
+        assert!(validate_manifest_path("plugin/example/plugin.json").is_err());
+    }
+
+    #[test]
+    fn sync_destination_maps_plugin_paths_to_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex_dir = dir.path().join(".codex-test");
+
+        assert_eq!(
+            sync_destination_for_manifest_path_with_roots(
+                "plugins/pdf-reader/plugin.json",
+                dir.path(),
+                &codex_dir
+            ),
+            dir.path().join("plugins/pdf-reader/plugin.json")
+        );
+        assert_eq!(
+            sync_destination_for_manifest_path_with_roots(
+                ".agents/plugins/marketplace.json",
+                dir.path(),
+                &codex_dir
+            ),
+            dir.path().join(".agents/plugins/marketplace.json")
+        );
+        assert_eq!(
+            sync_destination_for_manifest_path_with_roots("auth.json", dir.path(), &codex_dir),
+            codex_dir.join("auth.json")
+        );
+    }
+
+    #[test]
+    fn local_plugin_sync_collects_pdf_reader_and_marketplace() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let plugin_file = home.join("plugins/pdf-reader/plugin.json");
+        let marketplace_file = home.join(".agents/plugins/marketplace.json");
+        fs::create_dir_all(plugin_file.parent().unwrap()).unwrap();
+        fs::create_dir_all(marketplace_file.parent().unwrap()).unwrap();
+        fs::write(&plugin_file, "{}").unwrap();
+        fs::write(
+            &marketplace_file,
+            r#"{
+  "name": "pdf-reader",
+  "source": {
+    "source": "local",
+    "path": "./plugins/pdf-reader"
+  },
+  "policy": {
+    "installation": "AVAILABLE",
+    "authentication": "ON_INSTALL"
+  },
+  "category": "Productivity"
+}"#,
+        )
+        .unwrap();
+
+        let mut files = Vec::new();
+        add_plugin_dir_if_exists(&mut files, home, "plugins").unwrap();
+        add_absolute_if_exists(
+            &mut files,
+            marketplace_file,
+            ".agents/plugins/marketplace.json",
+        );
+        let paths = files
+            .into_iter()
+            .map(|file| file.relative_path)
+            .collect::<BTreeSet<_>>();
+
+        assert!(paths.contains("plugins/pdf-reader/plugin.json"));
+        assert!(paths.contains(".agents/plugins/marketplace.json"));
+        assert!(!paths.contains("plugin/pdf-reader/plugin.json"));
     }
 
     #[test]
